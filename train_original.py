@@ -11,10 +11,7 @@ import sys
 import argparse
 import json
 from typing import Tuple, Optional, Union
-import clip
-from PIL import Image
-import predict_utils
-import skimage.io as io
+
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -47,8 +44,7 @@ class ClipCocoDataset(Dataset):
         if self.normalize_prefix:
             prefix = prefix.float()
             prefix = prefix / prefix.norm(2, -1)
-        image_id = self.image_ids[item]
-        return tokens, mask, prefix, image_id
+        return tokens, mask, prefix
 
     def __init__(self, data_path: str,  prefix_length: int, gpt2_type: str = "gpt2",
                  normalize_prefix=False):
@@ -296,8 +292,7 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
           lr: float = 2e-5, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
 
     device = torch.device('cuda:0')
-    # batch_size = args.bs
-    batch_size = 1
+    batch_size = args.bs
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -308,48 +303,17 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
     )
-
-    
-    clip_model, preprocess = clip.load("ViT-B/32", device=device)
-
-
     # save_config(args)
     for epoch in range(epochs):
         print(f">>> Training epoch {epoch}")
         sys.stdout.flush()
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
-        for idx, (tokens, mask, prefix, image_id) in enumerate(train_dataloader):
+        for idx, (tokens, mask, prefix) in enumerate(train_dataloader):
             model.zero_grad()
             tokens, mask, prefix = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32)
-            
-            outputs = model(tokens, prefix, mask) # CausalLMOutputWithCrossAttentions
-            logits = outputs.logits[:, dataset.prefix_length - 1: -1] # (1, 40, 50257)
-            
-            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-            prefix_embed = model.clip_project(prefix).reshape(1, dataset.prefix_length, -1) 
-            # prefix_embed: torch.Size([1, 10, 768])   (batch_size, 10, prefix_embed_length)
-            text = predict_utils.generate2(model, tokenizer, embed=prefix_embed)
-            print("text", text)
-            # example text: The first and only time I have ever had a "f" in the "f" is when I was a kid.
-            text = clip.tokenize([text]).to(device)
-
-            print(image_id)
-            img_id = int(image_id[0])
-            filename = f"./data/coco/train2014/COCO_train2014_{img_id:012d}.jpg"
-            if not os.path.isfile(filename):
-                filename = f"./data/coco/val2014/COCO_val2014_{img_id:012d}.jpg"
-            image = io.imread(filename)
-            image = preprocess(Image.fromarray(image)).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                logits_per_image, logits_per_text = clip_model(image, text)
-                # probs = logits_per_image.softmax(dim=-1).cpu().numpy()
-                probs = logits_per_image.softmax(dim=-1)
-
-            probs.requires_grad_(True)
-            loss = torch.sum(probs, dim=0, )
-            # loss = torch.sum(torch.tensor(probs), dim=0)
-            # loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=0)
+            outputs = model(tokens, prefix, mask)
+            logits = outputs.logits[:, dataset.prefix_length - 1: -1]
+            loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=0)
             loss.backward()
             optimizer.step()
             scheduler.step()
