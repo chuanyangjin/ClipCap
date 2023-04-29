@@ -296,8 +296,8 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
           lr: float = 2e-5, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
 
     device = torch.device('cuda:0')
-    # batch_size = args.bs
-    batch_size = 1
+    batch_size = args.bs
+    #batch_size = 1
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -326,28 +326,29 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             logits = outputs.logits[:, dataset.prefix_length - 1: -1] # (1, 40, 50257)
             
             tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-            prefix_embed = model.clip_project(prefix).reshape(1, dataset.prefix_length, -1) 
+            prefix_embed = model.clip_project(prefix).reshape(args.bs, dataset.prefix_length, -1) 
             # prefix_embed: torch.Size([1, 10, 768])   (batch_size, 10, prefix_embed_length)
             text = predict_utils.generate2(model, tokenizer, embed=prefix_embed)
-            print("text", text)
+            #print("text", text)
             # example text: The first and only time I have ever had a "f" in the "f" is when I was a kid.
-            text = clip.tokenize([text]).to(device)
+            #text = clip.tokenize([text]).to(device)
+            text_feat = clip_model.encode_text(text)
+            loss = torch.sum(- 2.5 * torch.relu((prefix * text_feat).sum(dim=-1)), dim = 0)
+            #print(loss.shape)
+            #print(image_id)
+            #img_id = int(image_id[0])
+            #filename = f"./data/coco/train2014/COCO_train2014_{img_id:012d}.jpg"
+            #if not os.path.isfile(filename):
+            #    filename = f"./data/coco/val2014/COCO_val2014_{img_id:012d}.jpg"
+            #image = io.imread(filename)
+            #image = preprocess(Image.fromarray(image)).unsqueeze(0).to(device)
+            #logits_per_image, logits_per_text = clip_model(image, text)
+            # probs = logits_per_image.softmax(dim=-1).cpu().numpy()
+            #probs = logits_per_image.softmax(dim=-1)
 
-            print(image_id)
-            img_id = int(image_id[0])
-            filename = f"./data/coco/train2014/COCO_train2014_{img_id:012d}.jpg"
-            if not os.path.isfile(filename):
-                filename = f"./data/coco/val2014/COCO_val2014_{img_id:012d}.jpg"
-            image = io.imread(filename)
-            image = preprocess(Image.fromarray(image)).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                logits_per_image, logits_per_text = clip_model(image, text)
-                # probs = logits_per_image.softmax(dim=-1).cpu().numpy()
-                probs = logits_per_image.softmax(dim=-1)
-
-            probs.requires_grad_(True)
-            loss = torch.sum(probs, dim=0, )
+            #probs.requires_grad_(True)
+            #loss = torch.sum(probs, dim=0, )
+            print(loss.item())
             # loss = torch.sum(torch.tensor(probs), dim=0)
             # loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=0)
             loss.backward()
