@@ -13,8 +13,11 @@ import json
 from typing import Tuple, Optional, Union
 import clip
 from PIL import Image
-import predict_utils
+#import predict_utils
 import skimage.io as io
+
+CLIP_dict_length = 49408
+GPT2_dict_length = 50257
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -301,7 +304,9 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    model = model.to(device)
+    #model = model.to(device)
+    model.gpt = model.gpt.to(device)
+    model.clip_project = model.clip_project.to(device)
     model.train()
     optimizer = AdamW(model.parameters(), lr=lr)
     train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -321,29 +326,39 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
         for idx, (tokens, mask, prefix, image_id) in enumerate(train_dataloader):
             model.zero_grad()
-            tokens, mask, prefix = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32)
+            #tokens, mask, prefix = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32)
+            prefix = prefix.to(device, dtype = torch.float32)
             
-            outputs = model(tokens, prefix, mask) # CausalLMOutputWithCrossAttentions
-            logits = outputs.logits[:, dataset.prefix_length - 1: -1] # (1, 40, 50257)
+            #outputs = model(tokens, prefix, mask) # CausalLMOutputWithCrossAttentions
+            #logits = outputs.logits[:, dataset.prefix_length - 1: -1] # (1, 40, 50257)
             
-            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+            #tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
             prefix_embed = model.clip_project(prefix).reshape(args.bs, dataset.prefix_length, -1)
             output = model.gpt(inputs_embeds = prefix_embed)
             logits = output.logits
+            logits = logits[:, :, :CLIP_dict_length]
+            if logits.shape[1] < 77:
+                logits = torch.cat((logits, torch.zeros(logits.shape[0], 77 - logits.shape[1], CLIP_dict_length).to(device)), dim = 1)
             # prefix_embed: torch.Size([1, 10, 768])   (batch_size, 10, prefix_embed_length)
             #text = predict_utils.generate2(model, tokenizer, embed=prefix_embed)
             #text = clip.tokenize([text]).to(device)
-            text_feat = clip_model.encode_text(torch.argmax(logits, dim = -1))
-            # Compute the cosine similarity between the image and text embeddings
-            sim = torch.cosine_similarity(prefix, text_feat)
-            loss = -torch.mean(sim)
+            logits = torch.softmax(logits, dim = -1)
+            reinforce = - torch.sum(torch.log(torch.max(logits, dim = -1)[0]), dim = -1)
+            with torch.no_grad():
+                text_feat = clip_model.encode_text(torch.argmax(logits, dim = -1))
+                # Compute the cosine similarity between the image and text embeddings
+                sim = torch.diag(torch.cosine_similarity(prefix, text_feat)).detach()
+            loss =  torch.sum(sim * reinforce)
+            #loss = -torch.mean(sim)
+            #logits = torch.matmul(prefix.float(), text_feat.permute(1, 0).float()) / 0.1 # temperature parameter
+            #labels = torch.arange(text_feat.shape[0]).to(device)
+            #loss = torch.nn.CrossEntropyLoss()(logits, labels)
             
-            print(-loss.item())
             loss.backward()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            progress.set_postfix({"loss": loss.item()})
+            progress.set_postfix({"loss": torch.mean(sim).item()})
             progress.update()
             if (idx + 1) % 10000 == 0:
                 torch.save(
