@@ -80,7 +80,7 @@ class ClipCocoDataset(Dataset):
 class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
+        return self.model(x) + self.res_connect(x)
 
     def __init__(self, sizes: Tuple[int, ...], bias=True, act=nn.Tanh):
         super(MLP, self).__init__()
@@ -90,6 +90,7 @@ class MLP(nn.Module):
             if i < len(sizes) - 2:
                 layers.append(act())
         self.model = nn.Sequential(*layers)
+        self.res_connect = nn.Linear(sizes[0], sizes[-1], bias = bias)
 
 
 class MlpTransformer(nn.Module):

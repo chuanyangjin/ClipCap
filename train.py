@@ -294,6 +294,19 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
         print(f"{model_path} is not exist")
     return model, parser
 
+def encode_text(clip, text):
+    x = clip.token_embedding(text).type(clip.dtype)  # [batch_size, n_ctx, d_model]
+    x = x + clip.positional_embedding.type(clip.dtype)
+    x = x.permute(1, 0, 2)  # NLD -> LND
+    x = clip.transformer(x)
+    x = x.permute(1, 0, 2)  # LND -> NLD
+    x = clip.ln_final(x).type(clip.dtype)
+    
+    if len(text.shape) == 3:
+        text = text.argmax(dim = -1)
+    x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ clip.text_projection
+
+    return x
 
 def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
           lr: float = 2e-5, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
@@ -308,16 +321,29 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
     model.gpt = model.gpt.to(device)
     model.clip_project = model.clip_project.to(device)
     model.train()
-    optimizer = AdamW(model.parameters(), lr=lr)
     train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
-    )
 
     
     clip_model, preprocess = clip.load("ViT-B/32", device=device)
     clip_model.eval()
-
+    f, preprocess = clip.load("ViT-B/32", device=device)
+    #f.token_embedding = torch.nn.Linear(CLIP_dict_length, f.token_embedding.weight.shape[1]).to(device)
+    f.token_embedding = torch.nn.Sequential(
+        torch.nn.Linear(CLIP_dict_length, 2048),
+        torch.nn.ReLU(),
+        torch.nn.Linear(2048, 2048),
+        torch.nn.ReLU(),
+        torch.nn.Linear(2048, f.token_embedding.weight.shape[1])
+    ).to(device)
+    #optimizer = AdamW([{'params': model.parameters()}, {'params':f.parameters()}], lr=lr)
+    optimizer1 = AdamW(model.parameters(), lr=lr)
+    scheduler1 = get_linear_schedule_with_warmup(
+        optimizer1, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
+    )
+    optimizer2 = AdamW(f.token_embedding.parameters(), lr=lr)
+    scheduler2 = get_linear_schedule_with_warmup(
+        optimizer2, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
+    )
 
     # save_config(args)
     for epoch in range(epochs):
@@ -333,22 +359,43 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             #logits = outputs.logits[:, dataset.prefix_length - 1: -1] # (1, 40, 50257)
             
             #tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-            prefix_embed = model.clip_project(prefix).reshape(args.bs, dataset.prefix_length, -1)
-            output = model.gpt(inputs_embeds = prefix_embed)
-            logits = output.logits
-            logits = logits[:, :, :CLIP_dict_length]
-            if logits.shape[1] < 77:
-                logits = torch.cat((logits, torch.zeros(logits.shape[0], 77 - logits.shape[1], CLIP_dict_length).to(device)), dim = 1)
+            if idx % 10 == 0:
+                prefix_embed = model.clip_project(prefix).reshape(args.bs, dataset.prefix_length, -1)
+                output = model.gpt(inputs_embeds = prefix_embed)
+                logits = output.logits
+                logits = logits[:, :, :CLIP_dict_length]
+                logits = torch.softmax(logits, dim = -1)
+                if logits.shape[1] < 77:
+                    logits = torch.cat((logits, torch.zeros(logits.shape[0], 77 - logits.shape[1], CLIP_dict_length).to(device)), dim = 1)
+            else:
+                with torch.no_grad():
+                    prefix_embed = model.clip_project(prefix).reshape(args.bs, dataset.prefix_length, -1)
+                    output = model.gpt(inputs_embeds = prefix_embed)
+                    logits = output.logits
+                    logits = logits[:, :, :CLIP_dict_length]
+                    logits = torch.softmax(logits, dim = -1)
+                    if logits.shape[1] < 77:
+                        logits = torch.cat((logits, torch.zeros(logits.shape[0], 77 - logits.shape[1], CLIP_dict_length).to(device)), dim = 1)
             # prefix_embed: torch.Size([1, 10, 768])   (batch_size, 10, prefix_embed_length)
             #text = predict_utils.generate2(model, tokenizer, embed=prefix_embed)
             #text = clip.tokenize([text]).to(device)
-            logits = torch.softmax(logits, dim = -1)
-            reinforce = - torch.sum(torch.log(torch.max(logits, dim = -1)[0]), dim = -1)
+            #reinforce = - torch.sum(torch.log(torch.max(logits, dim = -1)[0]), dim = -1)
             with torch.no_grad():
-                text_feat = clip_model.encode_text(torch.argmax(logits, dim = -1))
-                # Compute the cosine similarity between the image and text embeddings
-                sim = torch.diag(torch.cosine_similarity(prefix, text_feat)).detach()
-            loss =  torch.sum(sim * reinforce)
+                clip_out = encode_text(clip_model, torch.argmax(logits, dim = -1))
+            #print(logits.shape, torch.argmax(logits, dim = -1).shape, f.token_embedding(logits).shape, clip_model.token_embedding(torch.argmax(logits, dim = -1)).shape)
+            f_out = encode_text(f, logits)
+            # Compute the cosine similarity between the image and text embeddings
+            sim = torch.sum(torch.cosine_similarity(prefix, f_out))
+            if idx % 10 != 0:
+                loss = torch.nn.MSELoss()(clip_out, f_out)
+                optimizer = optimizer2
+                scheduler = scheduler2
+            else:
+                loss = -sim
+                optimizer = optimizer1
+                scheduler = scheduler1
+            #loss =  -sim + lamb * torch.nn.MSELoss()(clip_out, f_out)
+            #print(loss)
             #loss = -torch.mean(sim)
             #logits = torch.matmul(prefix.float(), text_feat.permute(1, 0).float()) / 0.1 # temperature parameter
             #labels = torch.arange(text_feat.shape[0]).to(device)
@@ -358,7 +405,9 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            progress.set_postfix({"loss": torch.mean(sim).item()})
+            progress.set_postfix({"clip": torch.mean(torch.cosine_similarity(prefix, clip_out)).item(), 
+                                  "loss": torch.nn.MSELoss()(clip_out, f_out).item(),
+                                  "sim": sim.item() / batch_size})
             progress.update()
             if (idx + 1) % 10000 == 0:
                 torch.save(
