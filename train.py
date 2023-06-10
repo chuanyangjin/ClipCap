@@ -14,7 +14,7 @@ from typing import Tuple, Optional, Union
 import clip
 from PIL import Image
 import predict_utils
-import skimage.io as io
+import skimage.io as io 
 
 CLIP_dict_length = 49408
 GPT2_dict_length = 50257
@@ -314,7 +314,8 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
           lr: float = 2e-5, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
 
     device = torch.device('cuda:0')
-    batch_size = args.bs
+    # batch_size = args.bs
+    batch_size = 1
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -332,8 +333,7 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
         print(f">>> Training epoch {epoch}")
         sys.stdout.flush()
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
-        for idx, (tokens, mask, prefix, image_id) in enumerate(train_dataloader):
-            model.zero_grad()
+        for idx, (tokens, mask, prefix, i
             prefix = prefix.to(device, dtype = torch.float32)
             prefix_embed = model.clip_project(prefix).reshape(args.bs, dataset.prefix_length, -1)
             
