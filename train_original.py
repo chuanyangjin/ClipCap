@@ -11,13 +11,7 @@ import sys
 import argparse
 import json
 from typing import Tuple, Optional, Union
-import clip
-from PIL import Image
-import predict_utils
-import skimage.io as io
 
-CLIP_dict_length = 49408
-GPT2_dict_length = 50257
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -50,8 +44,7 @@ class ClipCocoDataset(Dataset):
         if self.normalize_prefix:
             prefix = prefix.float()
             prefix = prefix / prefix.norm(2, -1)
-        image_id = self.image_ids[item]
-        return tokens, mask, prefix, image_id
+        return tokens, mask, prefix
 
     def __init__(self, data_path: str,  prefix_length: int, gpt2_type: str = "gpt2",
                  normalize_prefix=False):
@@ -295,20 +288,6 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
         print(f"{model_path} is not exist")
     return model, parser
 
-def encode_text(clip, text):
-    x = torch.sum(text * torch.arange(CLIP_dict_length).cuda(), dim = -1)
-    x = clip.token_embedding(x.long()).type(clip.dtype)  # [batch_size, n_ctx, d_model]
-    x = x + clip.positional_embedding.type(clip.dtype)
-    x = x.permute(1, 0, 2)  # NLD -> LND
-    x = clip.transformer(x)
-    x = x.permute(1, 0, 2)  # LND -> NLD
-    x = clip.ln_final(x).type(clip.dtype)
-    
-    if len(text.shape) == 3:
-        text = text.argmax(dim = -1)
-    x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ clip.text_projection
-
-    return x
 
 def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
           lr: float = 2e-5, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
@@ -325,42 +304,22 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
     )
-    clip_model, preprocess = clip.load("ViT-B/32", device=device)
-    clip_model.eval()
     # save_config(args)
     for epoch in range(epochs):
         print(f">>> Training epoch {epoch}")
         sys.stdout.flush()
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
-        for idx, (tokens, mask, prefix, image_id) in enumerate(train_dataloader):
+        for idx, (tokens, mask, prefix) in enumerate(train_dataloader):
             model.zero_grad()
-            prefix = prefix.to(device, dtype = torch.float32)
-            prefix_embed = model.clip_project(prefix).reshape(args.bs, dataset.prefix_length, -1)
-            
-            # prefix_embed: torch.Size([1, 10, 768])   (batch_size, 10, prefix_embed_length)
-            tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-            texts = []
-            for each_embed in prefix_embed:
-                text = predict_utils.generate2(model, tokenizer, embed=each_embed.unsqueeze(0), entry_length = args.prefix_length_clip)
-                #text = clip.tokenize([text]).to(device)
-                text = torch.cat((text, torch.zeros(text.shape[0], 77 - text.shape[1], GPT2_dict_length).to(device)), dim = 1)
-                texts.append(text[0])
-            text = torch.stack(texts, dim = 0)[:,:,:CLIP_dict_length]
-            print(text.shape)
-            f_out = encode_text(clip_model, text)
-            #print(f_out.shape)
-            # Compute the cosine similarity between the image and text embeddings
-            sim = torch.sum(torch.cosine_similarity(prefix, f_out))
-            loss = -sim
-            
+            tokens, mask, prefix = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32)
+            outputs = model(tokens, prefix, mask)
+            logits = outputs.logits[:, dataset.prefix_length - 1: -1]
+            loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=0)
             loss.backward()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            #progress.set_postfix({"clip": torch.mean(torch.cosine_similarity(prefix, clip_out)).item(), 
-            #                      "loss": torch.nn.MSELoss()(clip_out, f_out).item(),
-            #                      "sim": sim.item() / batch_size})
-            progress.set_postfix({"sim": sim.item() / batch_size})
+            progress.set_postfix({"loss": loss.item()})
             progress.update()
             if (idx + 1) % 10000 == 0:
                 torch.save(
@@ -391,7 +350,6 @@ def main():
     parser.add_argument('--num_layers', type=int, default=8)
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
-    parser.add_argument('--lr', type=float, default=1e-4)
     args = parser.parse_args()
     prefix_length = args.prefix_length
     dataset = ClipCocoDataset(args.data, prefix_length, normalize_prefix=args.normalize_prefix)
@@ -406,7 +364,7 @@ def main():
                                   num_layers=args.num_layers, mapping_type=args.mapping_type)
         print("Train both prefix and GPT")
         sys.stdout.flush()
-    train(dataset, model, args, output_dir=args.out_dir, lr = args.lr, output_prefix=args.prefix)
+    train(dataset, model, args, output_dir=args.out_dir, output_prefix=args.prefix)
 
 
 if __name__ == '__main__':
