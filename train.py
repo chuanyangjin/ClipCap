@@ -314,8 +314,8 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
           lr: float = 2e-5, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
 
     device = torch.device('cuda:0')
-    # batch_size = args.bs
-    batch_size = 1
+    batch_size = args.bs
+    # batch_size = 1
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -333,10 +333,13 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
         print(f">>> Training epoch {epoch}")
         sys.stdout.flush()
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
-        for idx, (tokens, mask, prefix, i
+        for idx, (tokens, mask, prefix, image_id) in enumerate(train_dataloader):
             prefix = prefix.to(device, dtype = torch.float32)
+            #print(prefix.shape)
+            #prefix_embed = model.clip_project(prefix)
+            #print(prefix_embed.shape)
             prefix_embed = model.clip_project(prefix).reshape(args.bs, dataset.prefix_length, -1)
-            
+
             # prefix_embed: torch.Size([1, 10, 768])   (batch_size, 10, prefix_embed_length)
             tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
             texts = []
@@ -352,12 +355,12 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             # Compute the cosine similarity between the image and text embeddings
             sim = torch.sum(torch.cosine_similarity(prefix, f_out))
             loss = -sim
-            
+
             loss.backward()
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            #progress.set_postfix({"clip": torch.mean(torch.cosine_similarity(prefix, clip_out)).item(), 
+            #progress.set_postfix({"clip": torch.mean(torch.cosine_similarity(prefix, clip_out)).item(),
             #                      "loss": torch.nn.MSELoss()(clip_out, f_out).item(),
             #                      "sim": sim.item() / batch_size})
             progress.set_postfix({"sim": sim.item() / batch_size})
